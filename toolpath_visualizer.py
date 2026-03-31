@@ -1,4 +1,7 @@
 from pathlib import Path
+import subprocess
+import sys
+import json
 
 import matplotlib
 
@@ -10,92 +13,123 @@ from matplotlib.animation import FuncAnimation, PillowWriter
 from matplotlib.colors import ListedColormap
 from matplotlib.patches import Circle
 
+from toolpath_core import (
+    PocketSpec,
+    apply_sinusoidal_perturbation,
+    build_disk_offsets,
+    build_pocket_raster,
+    carve_2d,
+    center_to_index,
+    create_material_grid,
+    resample_polyline,
+)
+
 
 OUTPUT_GIF = Path(__file__).with_name("pocket_toolpath_comparison.gif")
+MIN_TOOL_DIAMETER_MM = 10.0
+TOOL_RENDER_PNG = Path(__file__).with_name("tool_model_render.png")
+TOOL_RENDER_STL = Path(__file__).with_name("tool_model_render.stl")
+TOOL_RENDER_SCRIPT = Path(__file__).with_name("tool_model_cadquery_render.py")
+TOOL_RENDER_META = Path(__file__).with_name("tool_model_render.meta.json")
 
 
-def build_pocket_raster(width: float, height: float, stepover: float) -> np.ndarray:
-    y_levels = np.arange(0.0, height + 1e-9, stepover)
-    if y_levels[-1] < height:
-        y_levels = np.append(y_levels, height)
-
-    points: list[tuple[float, float]] = []
-    for i, y in enumerate(y_levels):
-        if i % 2 == 0:
-            points.append((0.0, y))
-            points.append((width, y))
-        else:
-            points.append((width, y))
-            points.append((0.0, y))
-    return np.asarray(points, dtype=float)
+TOOL_CONFIG = {
+    "type": "Flat End Mill",
+    "flutes": 3,
+    "flute_length_mm": 25.0,
+    "stickout_mm": 72.0,
+    "helix_deg": 40.0,
+    "tool_material": "Carbide",
+}
 
 
-def resample_polyline(path: np.ndarray, samples: int) -> tuple[np.ndarray, np.ndarray]:
-    deltas = np.diff(path, axis=0)
-    seg_lengths = np.sqrt((deltas**2).sum(axis=1))
-    cumulative = np.concatenate([[0.0], np.cumsum(seg_lengths)])
-    total_length = cumulative[-1]
-
-    s_targets = np.linspace(0.0, total_length, samples)
-    x_new = np.interp(s_targets, cumulative, path[:, 0])
-    y_new = np.interp(s_targets, cumulative, path[:, 1])
-    return np.column_stack([x_new, y_new]), s_targets
+def resolve_tool_spec(diameter_mm: float) -> dict[str, float | int | str]:
+    spec = dict(TOOL_CONFIG)
+    spec["diameter_mm"] = float(diameter_mm)
+    return spec
 
 
-def apply_sinusoidal_perturbation(
-    path: np.ndarray,
-    s_values: np.ndarray,
-    amplitude: float,
-    wavelength: float,
-) -> np.ndarray:
-    dx = np.gradient(path[:, 0])
-    dy = np.gradient(path[:, 1])
-    tangent_norm = np.sqrt(dx**2 + dy**2) + 1e-12
-    tx = dx / tangent_norm
-    ty = dy / tangent_norm
+def ensure_tool_render(tool_spec: dict[str, float | int | str]) -> None:
+    if not TOOL_RENDER_SCRIPT.exists():
+        return
 
-    nx = -ty
-    ny = tx
+    desired_meta = {
+        "tool_type": str(tool_spec["type"]),
+        "diameter_mm": float(tool_spec["diameter_mm"]),
+        "flutes": int(tool_spec["flutes"]),
+        "flute_length_mm": float(tool_spec["flute_length_mm"]),
+        "stickout_mm": float(tool_spec["stickout_mm"]),
+        "helix_deg": float(tool_spec["helix_deg"]),
+        "tool_material": str(tool_spec["tool_material"]),
+    }
 
-    signal = amplitude * np.sin(2.0 * np.pi * s_values / wavelength)
-    x_perturbed = path[:, 0] + signal * nx
-    y_perturbed = path[:, 1] + signal * ny
-    return np.column_stack([x_perturbed, y_perturbed])
+    existing_meta = None
+    if TOOL_RENDER_META.exists():
+        try:
+            existing_meta = json.loads(TOOL_RENDER_META.read_text(encoding="utf-8"))
+        except Exception:
+            existing_meta = None
+
+    needs_regen = (
+        (not TOOL_RENDER_PNG.exists())
+        or (TOOL_RENDER_SCRIPT.stat().st_mtime > TOOL_RENDER_PNG.stat().st_mtime)
+        or (existing_meta != desired_meta)
+    )
+    if not needs_regen:
+        return
+
+    cmd = [
+        sys.executable,
+        str(TOOL_RENDER_SCRIPT),
+        "--tool-type",
+        str(tool_spec["type"]),
+        "--diameter-mm",
+        f"{float(tool_spec['diameter_mm']):.6f}",
+        "--flutes",
+        str(int(tool_spec["flutes"])),
+        "--flute-length-mm",
+        f"{float(tool_spec['flute_length_mm']):.6f}",
+        "--stickout-mm",
+        f"{float(tool_spec['stickout_mm']):.6f}",
+        "--helix-deg",
+        f"{float(tool_spec['helix_deg']):.6f}",
+        "--tool-material",
+        str(tool_spec["tool_material"]),
+        "--png",
+        str(TOOL_RENDER_PNG),
+        "--stl",
+        str(TOOL_RENDER_STL),
+    ]
+    try:
+        subprocess.run(cmd, check=True, capture_output=True, text=True)
+    except Exception as exc:
+        print(f"Tool render generation failed: {exc}")
+        return
+
+    if TOOL_RENDER_PNG.exists():
+        try:
+            TOOL_RENDER_META.write_text(json.dumps(desired_meta, indent=2), encoding="utf-8")
+        except Exception:
+            pass
 
 
-def create_material_grid(width: float, height: float, cell_mm: float) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    x = np.arange(0.0, width + cell_mm, cell_mm)
-    y = np.arange(0.0, height + cell_mm, cell_mm)
-    xx, yy = np.meshgrid(x, y)
-    remaining = np.ones_like(xx, dtype=np.uint8)
-    return xx, yy, remaining
-
-
-def build_disk_offsets(cell_size: float, tool_radius_mm: float) -> tuple[np.ndarray, np.ndarray]:
-    r_cells = int(np.ceil(tool_radius_mm / max(cell_size, 1e-12)))
-    offsets = np.arange(-r_cells, r_cells + 1, dtype=int)
-    ox, oy = np.meshgrid(offsets, offsets)
-    mask = (ox * cell_size) ** 2 + (oy * cell_size) ** 2 <= tool_radius_mm**2
-    return ox[mask], oy[mask]
-
-
-def center_to_index(cx: float, cy: float, x0: float, y0: float, cell_x: float, cell_y: float) -> tuple[int, int]:
-    ix = int(np.rint((cx - x0) / max(cell_x, 1e-12)))
-    iy = int(np.rint((cy - y0) / max(cell_y, 1e-12)))
-    return ix, iy
-
-
-def carve_tool_swept_area(
-    remaining: np.ndarray,
-    center_ix: int,
-    center_iy: int,
-    ox: np.ndarray,
-    oy: np.ndarray,
-) -> None:
-    xs = center_ix + ox
-    ys = center_iy + oy
-    valid = (xs >= 0) & (xs < remaining.shape[1]) & (ys >= 0) & (ys < remaining.shape[0])
-    remaining[ys[valid], xs[valid]] = 0
+def add_tool_inset(ax, tool_spec: dict[str, float | int | str]) -> None:
+    inset = ax.inset_axes([0.60, 0.56, 0.37, 0.41], zorder=30)
+    inset.set_xlim(0.0, 1.0)
+    inset.set_ylim(0.0, 1.0)
+    inset.set_xticks([])
+    inset.set_yticks([])
+    inset.set_facecolor((0.97, 0.98, 1.0, 0.98))
+    for spine in inset.spines.values():
+        spine.set_linewidth(0.9)
+        spine.set_color("#9ca3af")
+    if TOOL_RENDER_PNG.exists():
+        img = plt.imread(TOOL_RENDER_PNG)
+        inset.imshow(img, extent=[0.04, 0.48, 0.08, 0.95], aspect="auto")
+    inset.text(0.52, 0.95, "Tool Used", fontsize=7.6, fontweight="bold", ha="left", va="top", color="#111827")
+    inset.text(0.52, 0.79, f"D: {tool_spec['diameter_mm']:.1f} mm", fontsize=6.8, ha="left", color="#111827")
+    inset.text(0.52, 0.64, f"Z: {int(tool_spec['flutes'])}", fontsize=6.8, ha="left", color="#111827")
+    inset.text(0.52, 0.49, f"Helix: {tool_spec['helix_deg']:.0f} deg", fontsize=6.8, ha="left", color="#111827")
 
 
 def estimate_chip_metrics_7075(
@@ -146,6 +180,8 @@ def animate_paths(
     width = max(base_path[:, 0].max(), perturbed_path[:, 0].max())
     height = max(base_path[:, 1].max(), perturbed_path[:, 1].max())
     tool_radius_mm = tool_diameter_mm / 2.0
+    tool_spec = resolve_tool_spec(tool_diameter_mm)
+    ensure_tool_render(tool_spec)
 
     fig, axes = plt.subplots(1, 2, figsize=(12, 5), sharex=True, sharey=True)
     fig.patch.set_facecolor("white")
@@ -235,6 +271,7 @@ def animate_paths(
         fontsize=9,
         bbox={"boxstyle": "round,pad=0.25", "facecolor": "white", "edgecolor": "#9ca3af", "alpha": 0.88},
     )
+    add_tool_inset(axes[1], tool_spec)
 
     def init():
         base_mat.set_data(remaining_base)
@@ -253,8 +290,8 @@ def animate_paths(
 
         base_ix, base_iy = center_to_index(bx, by, x0, y0, cell_x, cell_y)
         pert_ix, pert_iy = center_to_index(px, py, x0, y0, cell_x, cell_y)
-        carve_tool_swept_area(remaining_base, base_ix, base_iy, ox, oy)
-        carve_tool_swept_area(remaining_pert, pert_ix, pert_iy, ox, oy)
+        carve_2d(remaining_base, base_ix, base_iy, ox, oy)
+        carve_2d(remaining_pert, pert_ix, pert_iy, ox, oy)
         base_mat.set_data(remaining_base)
         pert_mat.set_data(remaining_pert)
         removed_base = (remaining_base == 0).astype(float)
@@ -282,20 +319,17 @@ def animate_paths(
 
 def main() -> None:
     # Pocket geometry and path settings (units can be mm).
-    width = 10.0
-    height = 7.0
-    stepover = 0.8
-
-    # Animation/path resolution.
-    samples = 260
-
-    # Perturbation settings for the modified path.
-    amplitude = 0.18
-    wavelength = 1.4
+    spec = PocketSpec()
+    width = spec.width
+    height = spec.height
+    stepover = spec.stepover
+    samples = spec.samples
+    amplitude = spec.perturb_amplitude
+    wavelength = spec.perturb_wavelength
 
     # Example cutting conditions (update these to your real process window).
-    # Cutter rule: diameter is 2x stepover.
-    tool_diameter_mm = 2.0 * stepover
+    # Cutter rule: diameter is 2x stepover with a hard 10 mm minimum.
+    tool_diameter_mm = max(MIN_TOOL_DIAMETER_MM, 2.0 * stepover)
     flutes = 3
     spindle_rpm = 10000.0
     feed_mm_min = 1800.0

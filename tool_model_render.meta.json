@@ -1,0 +1,9 @@
+{
+  "tool_type": "Flat End Mill",
+  "diameter_mm": 10.0,
+  "flutes": 3,
+  "flute_length_mm": 25.0,
+  "stickout_mm": 72.0,
+  "helix_deg": 40.0,
+  "tool_material": "Carbide"
+}
