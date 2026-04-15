@@ -1,18 +1,17 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 from pathlib import Path
 import argparse
 import re
 from urllib.parse import unquote
-from html import unescape
 
 import nbformat
 from nbconvert import HTMLExporter
 
 
 def normalize_fragment_ids(html: str) -> str:
-    id_pattern = re.compile(r'id=\"([^\"]+)\"')
-    href_pattern = re.compile(r'href=\"#([^\"]+)\"')
+    id_pattern = re.compile(r'id="([^"]+)"')
+    href_pattern = re.compile(r'href="#([^"]+)"')
 
     ids = set(id_pattern.findall(html))
     mapping: dict[str, str] = {}
@@ -22,84 +21,50 @@ def normalize_fragment_ids(html: str) -> str:
             mapping[old] = new
 
     for old, new in mapping.items():
-        html = html.replace(f'id=\"{old}\"', f'id=\"{new}\"')
-        html = html.replace(f'href=\"#{old}\"', f'href=\"#{new}\"')
+        html = html.replace(f'id="{old}"', f'id="{new}"')
+        html = html.replace(f'href="#{old}"', f'href="#{new}"')
 
-    # Also decode any remaining internal href fragments for consistency.
     def _decode_href(m: re.Match[str]) -> str:
         frag = m.group(1)
-        return f'href=\"#{unquote(frag)}\"'
+        return f'href="#{unquote(frag)}"'
 
-    html = href_pattern.sub(_decode_href, html)
-    html = html.replace("Â¶", "¶")
-    return html
+    return href_pattern.sub(_decode_href, html)
 
 
 def fix_common_mojibake(html: str) -> str:
-    # Common UTF-8/Windows-1252 mojibake seen in exported notebook text.
     replacements = {
-        "\u00c3\u2014": "\u00d7",   # Ã— -> ×
         "Ã—": "×",
-        "Â ": " ",
         "Â¶": "¶",
+        "Â—": "—",
+        "Â–": "–",
+        "Â“": "“",
+        "Â”": "”",
+        "Â’": "’",
     }
     for bad, good in replacements.items():
         html = html.replace(bad, good)
     return html
 
 
-def inject_contents_nav(html: str) -> str:
-    heading_pattern = re.compile(
-        r"<h([2-3]) id=\"([^\"]+)\">(.*?)</h\1>",
-        re.DOTALL,
+def strip_legacy_contents_nav(html: str) -> str:
+    html = re.sub(
+        r"<style>\s*#notebook-contents\s*\{.*?\.jp-RenderedImage img \{.*?</style>",
+        "",
+        html,
+        flags=re.DOTALL,
     )
-    headings: list[tuple[int, str, str]] = []
-    for level, frag_id, inner in heading_pattern.findall(html):
-        text = re.sub(r"<[^>]+>", "", inner).strip()
-        text = unescape(text)
-        text = text.replace("¶", "").strip()
-        if not text:
-            continue
-        headings.append((int(level), frag_id, text))
-
-    if not headings:
-        return html
-
-    items: list[str] = []
-    for level, frag_id, text in headings:
-        cls = "toc-h2" if level == 2 else "toc-h3"
-        items.append(f'<li class="{cls}"><a href="#{frag_id}">{text}</a></li>')
-    nav = (
-        '<nav id="notebook-contents" class="notebook-contents">'
-        "<h2>Contents</h2>"
-        '<ul class="notebook-contents-list">'
-        + "".join(items)
-        + "</ul></nav>"
+    html = re.sub(
+        r'<nav id="notebook-contents" class="notebook-contents">.*?</nav>',
+        "",
+        html,
+        flags=re.DOTALL,
     )
+    return html
 
-    style = """
-<style>
-#notebook-contents { border: 1px solid #d0d7de; border-radius: 8px; padding: 12px 14px; margin: 12px 0 18px; background: #f8fafc; }
-#notebook-contents h2 { margin: 0 0 8px; font-size: 1.15rem; }
-.notebook-contents-list { margin: 0; padding-left: 1.15rem; }
-.notebook-contents-list li { margin: 3px 0; }
-.notebook-contents-list li.toc-h3 { margin-left: 0.8rem; }
-.jp-RenderedImage img { display: block; max-width: 100%; height: auto; }
-</style>
-"""
 
-    # Insert contents block before the first H2.
-    first_h2_match = re.search(r"<h2 id=\"", html)
-    if first_h2_match:
-        insert_at = first_h2_match.start()
-        return html[:insert_at] + style + nav + html[insert_at:]
-
-    # Fallback: append at the beginning of body.
-    body_match = re.search(r"<body[^>]*>", html)
-    if body_match:
-        insert_at = body_match.end()
-        return html[:insert_at] + style + nav + html[insert_at:]
-    return style + nav + html
+def remove_anchor_links(html: str) -> str:
+    # Drop Jupyter heading anchor glyph links entirely to prevent mojibake artifacts.
+    return re.sub(r'<a class="anchor-link" href="#[^"]*">.*?</a>', "", html)
 
 
 def export_one(ipynb_path: Path) -> Path:
@@ -113,7 +78,8 @@ def export_one(ipynb_path: Path) -> Path:
 
     body = fix_common_mojibake(body)
     body = normalize_fragment_ids(body)
-    body = inject_contents_nav(body)
+    body = strip_legacy_contents_nav(body)
+    body = remove_anchor_links(body)
 
     out_html = ipynb_path.with_suffix(".html")
     out_html.write_text(body, encoding="utf-8")

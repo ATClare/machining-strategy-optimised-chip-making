@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import numpy as np
 import pandas as pd
+from itertools import product
 
 
 def engagement_angle(radial_doc_mm: float, tool_diameter_mm: float) -> float:
@@ -31,6 +32,62 @@ def chip_metrics_base(
         "entry_angle_rad": phi,
         "chip_contact_length_mm": chip_contact_length,
     }
+
+
+def chip_metrics_from_chipload(
+    tool_diameter_mm: float,
+    flutes: int,
+    spindle_rpm: float,
+    chipload_mm_per_tooth: float,
+    axial_doc_mm: float,
+    radial_doc_mm: float,
+) -> dict[str, float]:
+    feed_mm_min = chipload_mm_per_tooth * spindle_rpm * flutes
+    base = chip_metrics_base(
+        tool_diameter_mm=tool_diameter_mm,
+        flutes=flutes,
+        spindle_rpm=spindle_rpm,
+        feed_mm_min=feed_mm_min,
+        axial_doc_mm=axial_doc_mm,
+        radial_doc_mm=radial_doc_mm,
+    )
+    return {
+        **base,
+        "spindle_rpm": spindle_rpm,
+        "feed_mm_min": feed_mm_min,
+        "chipload_mm_per_tooth": chipload_mm_per_tooth,
+        "axial_doc_mm": axial_doc_mm,
+        "radial_doc_mm": radial_doc_mm,
+        "chip_size_proxy_mm2": base["h_mean_mm"] * base["chip_contact_length_mm"],
+    }
+
+
+def chip_size_map_fixed_tool(
+    rpm_values: np.ndarray,
+    chipload_values_mm_per_tooth: np.ndarray,
+    axial_doc_values_mm: np.ndarray,
+    radial_doc_values_mm: np.ndarray,
+    tool_diameter_mm: float = 12.0,
+    flutes: int = 4,
+) -> pd.DataFrame:
+    rows: list[dict[str, float]] = []
+    for rpm, chipload, ap, ae in product(
+        rpm_values,
+        chipload_values_mm_per_tooth,
+        axial_doc_values_mm,
+        radial_doc_values_mm,
+    ):
+        rows.append(
+            chip_metrics_from_chipload(
+                tool_diameter_mm=tool_diameter_mm,
+                flutes=flutes,
+                spindle_rpm=float(rpm),
+                chipload_mm_per_tooth=float(chipload),
+                axial_doc_mm=float(ap),
+                radial_doc_mm=float(ae),
+            )
+        )
+    return pd.DataFrame(rows)
 
 
 def stability_and_chatter(
